@@ -7,6 +7,10 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .planner.balance import (
+    MAX_LEVELS_PER_SLOT as BALANCE_MAX_LEVELS_PER_SLOT,
+)
+from .planner.balance import MAX_SLOTS as BALANCE_MAX_SLOTS
 from .planner.calibration import (
     MAX_LAG_CANDIDATES,
     unwrap_shortest_arc,
@@ -478,3 +482,162 @@ class ProjectDomeApertureResponse(BaseModel):
     dome_radius: float
     origin: EnuPoint
     results: list[ApertureSampleResult]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/plan-dome-balance
+# ---------------------------------------------------------------------------
+
+
+class InstalledPart(BaseModel):
+    mass: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="已装部件质量（>= 0；零质量部件不贡献质量矩）",
+    )
+    radius: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="部件质心到旋转轴的半径（>= 0）",
+    )
+    azimuth: float = Field(
+        ..., allow_inf_nan=False,
+        description="部件相对旋转轴的方位角（度，北为 0°、向东递增，可取任意实数）",
+    )
+
+
+class BalanceSlot(BaseModel):
+    id: str = Field(
+        ..., min_length=1, description="槽位 ID（非空字符串，请求内唯一）"
+    )
+    radius: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="槽位到旋转轴的半径（>= 0）"
+    )
+    azimuth: float = Field(
+        ..., allow_inf_nan=False,
+        description="槽位方位角（度，北为 0°、向东递增，可取任意实数）",
+    )
+    mass_limit: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="该槽位允许的最大配重质量（>= 0；至少需容纳一个 mass_step 档位）",
+    )
+
+
+class PlanDomeBalanceRequest(BaseModel):
+    installed_parts: list[InstalledPart] = Field(
+        ..., min_length=1, description="已装部件清单（至少 1 个）"
+    )
+    slots: list[BalanceSlot] = Field(
+        ..., min_length=1, max_length=BALANCE_MAX_SLOTS,
+        description="候选配重槽位（1..8 个，ID 唯一）",
+    )
+    mass_step: float = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="统一配重质量档位步长（> 0）；每槽可选质量为 "
+        "0, mass_step, 2·mass_step, … 且不超过该槽 mass_limit",
+    )
+    mass_tolerance_ratio: float = Field(
+        ..., ge=0, lt=1, allow_inf_nan=False,
+        description="质量相对偏差（>= 0 且 < 1）；实际质量可取 "
+        "标称·(1 ± 该值)",
+    )
+    azimuth_tolerance: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="方位偏差半宽（度，>= 0）；实际方位可取标称 ± 该值",
+    )
+    residual_moment_limit: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="残余质量矩模长验收上限（>= 0）；最坏情景模长不超过它即达标",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "PlanDomeBalanceRequest":
+        ids = [s.id for s in self.slots]
+        if len(set(ids)) != len(ids):
+            raise ValueError("slots 的 id 必须唯一")
+        for s in self.slots:
+            # 与 planner.balance.slot_levels 相同的取档规则
+            n_levels = int(math.floor(s.mass_limit / self.mass_step + 1e-9))
+            if n_levels < 1:
+                raise ValueError(
+                    f"槽位 {s.id} 的 mass_limit={s.mass_limit} 小于 "
+                    f"mass_step={self.mass_step}，至少需容纳一个非零档位"
+                )
+            if n_levels > BALANCE_MAX_LEVELS_PER_SLOT:
+                raise ValueError(
+                    f"槽位 {s.id} 的非零质量档位数 {n_levels} 超过上限 "
+                    f"{BALANCE_MAX_LEVELS_PER_SLOT}"
+                )
+        return self
+
+
+class MomentVector2(BaseModel):
+    east: float = Field(..., description="质量矩东向分量 x（质量·长度）")
+    north: float = Field(..., description="质量矩北向分量 y（质量·长度）")
+
+
+class BalanceWeightItem(BaseModel):
+    slot_id: str
+    radius: float = Field(..., description="槽位半径（回显）")
+    nominal_mass: float = Field(..., description="该槽位选定的标称配重质量")
+    nominal_azimuth: float = Field(
+        ..., description="槽位标称方位角（度，按请求回显，未做 0..360 归一化）"
+    )
+    worst_mass: float = Field(
+        ..., description="最坏偏差情景下该配重的实际质量"
+    )
+    worst_azimuth: float = Field(
+        ..., description="最坏偏差情景下该配重的实际方位角（度，"
+        "= 标称方位 + azimuth_sign·azimuth_tolerance，未归一化）"
+    )
+
+
+class WorstDeviationItem(BaseModel):
+    slot_id: str
+    mass: float = Field(..., description="该配重在最坏组合中的实际质量")
+    azimuth: float = Field(
+        ..., description="该配重在最坏组合中的实际方位角（度，未归一化）"
+    )
+    mass_sign: int = Field(
+        ..., description="质量偏差符号：-1 负偏差、0 标称、+1 正偏差"
+    )
+    azimuth_sign: int = Field(
+        ..., description="方位偏差符号：-1 负偏差、0 标称、+1 正偏差"
+    )
+
+
+class PlanDomeBalanceResponse(BaseModel):
+    original_moment: MomentVector2 = Field(
+        ..., description="全部已装部件合成的原始质量矩向量"
+    )
+    original_magnitude: float = Field(..., description="原始质量矩模长")
+    weights: list[BalanceWeightItem] = Field(
+        ..., description="配重清单（按槽位 ID 排序；零配重方案为空列表）"
+    )
+    total_balance_mass: float = Field(
+        ..., description="配重总质量 Σ nominal_mass"
+    )
+    nominal_residual: MomentVector2 = Field(
+        ..., description="标称配重下的残余质量矩向量"
+    )
+    nominal_magnitude: float = Field(
+        ..., description="标称残余质量矩模长"
+    )
+    worst_residual: MomentVector2 = Field(
+        ..., description="最坏偏差情景下的残余质量矩向量"
+    )
+    worst_magnitude: float = Field(
+        ..., description="最坏残余质量矩模长（所有偏差组合中的最大模长）"
+    )
+    worst_deviation_combo: list[WorstDeviationItem] = Field(
+        ..., description="达到最坏模长的偏差组合（与 weights 同序；"
+        "多个组合并列时取偏差符号字典序最小者）；零配重方案为空列表"
+    )
+    residual_moment_limit: float = Field(..., description="验收限值（回显）")
+    compliant: bool = Field(
+        ..., description="最坏残余质量矩模长是否不超过验收限值"
+    )
+    details: dict = Field(
+        ..., description="枚举诊断：evaluated_plans（穷举方案数）、"
+        "max_scenarios_per_plan（单方案最多偏差情景数）、"
+        "mass_vector（按槽位 ID 排列的质量向量，未使用槽位记 0）、"
+        "slot_ids（质量向量各分量对应的槽位 ID）"
+    )

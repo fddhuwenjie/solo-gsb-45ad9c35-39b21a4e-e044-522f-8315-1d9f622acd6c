@@ -467,6 +467,116 @@ curl -X POST http://localhost:8000/api/v1/project-dome-aperture \
 `B = o·d ≥ 0` 时正根取 `-c/(B+√(B²−c))`），在起点贴近球面的**近切线**
 情形下避免相消误差。
 
+### POST `/api/v1/plan-dome-balance`
+
+圆顶检修时的**静平衡配重规划**：给定已装部件的质量、旋转轴半径与方位，
+以及若干候选槽位（ID、半径、方位、质量上限）与统一的质量档位步长、质量
+相对偏差、方位偏差和残余质量矩限值，**精确枚举**“零配重、单槽、两槽”
+全部方案，并对每个非零配重的质量与方位偏差组合做**穷举验收**，按最坏
+残余质量矩等四级择优键返回唯一最优方案。
+
+坐标系：质量矩为绕旋转轴的二维向量，方位**北为 0°、向东递增**（东 90°、
+南 180°、西 270°），可取任意实数（如 `350°`、`-10°`、`-190°` 按模 360°
+等价处理，跨 0° 无需特判）；配重矩与已装部件矩同向叠加，平衡时配重加在
+原始质量矩的反方向。
+
+**请求字段**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `installed_parts` | object[] | 已装部件（至少 1 个）：`mass`（≥ 0）、`radius`（≥ 0）、`azimuth`（度） |
+| `slots` | object[] | 候选槽位（**1..8 个**，ID 非空且唯一）：`id`、`radius`（≥ 0）、`azimuth`、`mass_limit`（≥ 0） |
+| `mass_step` | number | 统一质量档位步长（> 0）；每槽可选质量为 `0, step, 2·step, …` 且 ≤ 该槽 `mass_limit`，**每槽非零档位最多 40 个**，且至少容纳 1 档 |
+| `mass_tolerance_ratio` | number | 质量相对偏差（≥ 0 且 < 1）：实际质量取 `标称·(1 ± 该值)` 与标称三档 |
+| `azimuth_tolerance` | number | 方位偏差半宽（度，≥ 0）：实际方位取 `标称 ± 该值` 与标称三档 |
+| `residual_moment_limit` | number | 残余质量矩模长验收上限（≥ 0） |
+
+方案约束：**最多使用两个槽位**；零配重始终作为候选。枚举方案数为
+`1 + Σ档位_i + Σ_{i<j} 档位_i·档位_j`，8 槽 × 40 档的极限规模为 45 121
+个方案。
+
+**偏差情景穷举**：每个非零配重的质量与方位各取“负偏差 / 标称 / 正偏差”
+三档，k 个非零配重即 9^k 个组合（单槽 9 个、两槽 81 个），逐一计算残余
+质量矩向量与模长，取最大模长为**最坏残余质量矩**；多个组合并列时取偏差
+符号按配重顺序（按槽位 ID 排序）的字典序最小者。
+
+**择优键（依次比较，差值不超过 1e-9 视为并列）**：
+
+1. 最坏残余质量矩模长（小者优）；
+2. 标称残余质量矩模长（小者优）；
+3. 总配重质量 `Σ nominal_mass`（小者优）；
+4. 按槽位 ID 排列的质量向量字典序（未使用槽位质量记 0，小者优）。
+
+**示例请求**：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/plan-dome-balance \
+  -H 'Content-Type: application/json' \
+  -d @examples/plan_dome_balance_request.json
+```
+
+已装部件为 `10@0°`（半径 1，原始矩 10 向北），两个候选槽位于 170°/190°
+（半径 1，步长 0.5，质量偏差 ±5%、方位偏差 ±1°，限值 1.0）。响应：
+
+```json
+{
+  "original_moment": {"east": 0.0, "north": 10.0},
+  "original_magnitude": 10.0,
+  "weights": [
+    {"slot_id": "A", "radius": 1.0, "nominal_mass": 5.0,
+     "nominal_azimuth": 170.0, "worst_mass": 4.75, "worst_azimuth": 169.0},
+    {"slot_id": "B", "radius": 1.0, "nominal_mass": 5.0,
+     "nominal_azimuth": 190.0, "worst_mass": 4.75, "worst_azimuth": 191.0}
+  ],
+  "total_balance_mass": 10.0,
+  "nominal_residual": {"east": -0.0, "north": 0.15192247},
+  "nominal_magnitude": 0.15192247,
+  "worst_residual": {"east": 0.0, "north": 0.674541757},
+  "worst_magnitude": 0.674541757,
+  "worst_deviation_combo": [
+    {"slot_id": "A", "mass": 4.75, "azimuth": 169.0,
+     "mass_sign": -1, "azimuth_sign": -1},
+    {"slot_id": "B", "mass": 4.75, "azimuth": 191.0,
+     "mass_sign": -1, "azimuth_sign": 1}
+  ],
+  "residual_moment_limit": 1.0,
+  "compliant": true,
+  "details": {
+    "evaluated_plans": 1681,
+    "max_scenarios_per_plan": 81,
+    "slot_ids": ["A", "B"],
+    "mass_vector": [5.0, 5.0]
+  }
+}
+```
+
+字段说明：
+
+- `original_moment` / `original_magnitude`：全部已装部件合成的原始质量矩
+  向量（`east`/`north`）与模长；
+- `weights`：配重清单，**按槽位 ID 排序**（零配重方案为空列表），每项
+  给出标称质量/方位与最坏情景下的实际质量/方位；方位按请求值回显
+  （不做 [0, 360) 归一化），`worst_azimuth = nominal_azimuth +
+  azimuth_sign·azimuth_tolerance`；
+- `nominal_residual` / `nominal_magnitude`：标称配重下的残余向量与模长；
+- `worst_residual` / `worst_magnitude`：最坏偏差情景的残余向量与模长；
+- `worst_deviation_combo`：达到最坏模长的偏差组合（与 `weights` 同序，
+  `mass_sign`/`azimuth_sign` ∈ {-1, 0, +1}；零配重方案为空）；
+- `compliant`：最坏模长 ≤ `residual_moment_limit`（边界 1e-9 内视为并列
+  达标）；**无方案达标时仍返回按择优键最优的方案**，仅 `compliant=false`；
+- `details`：`evaluated_plans` 穷举方案数、`max_scenarios_per_plan`
+  单方案最多偏差情景数（0/1/2 个配重对应 1/9/81）、`slot_ids` 与
+  `mass_vector`（按槽位 ID 排列、未使用槽位记 0）。
+
+注意：偏差可以改变最优方案——标称残余最小的档位在计入质量/方位最坏偏差
+后未必最优（例如欠补偿档位的最坏情景出现在质量负偏差方向），因此择优
+始终以**最坏残余**为第一键。
+
+**HTTP 422**：部件/槽位为空或槽位超过 8 个、槽位 ID 为空或重复、
+`mass_step <= 0`、某槽 `mass_limit < mass_step`（无可用档位）或非零档位
+超过 40 个、`mass_tolerance_ratio` 不在 [0, 1)、方位偏差或限值为负、
+质量/半径为负、NaN/无穷大等。
+
 ## 算法说明
 
 角度使用**未展开（unwrapped）**表示，因此跨 0°/360° 的跟踪不需要特判：每个
@@ -509,7 +619,7 @@ python3 scripts/fuzz_check.py
 
 ```
 app/
-  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture
+  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture、/api/v1/plan-dome-balance
   models.py            # Pydantic 请求/响应模型与参数校验
   planner/
     geometry.py        # 方位归一化、狭缝窗口（lift）、线缆裁剪、区间合并
@@ -518,9 +628,10 @@ app/
     calibration.py     # 最短弧展开 + 时延枚举/离群剔除/RMSE 同步标定
     interlock.py       # 安全联锁审计：分段常值重放、天气状态机、关闭义务
     aperture.py        # 视轴射线-偏心球面稳定求交、球面方位/高度、最短覆盖圆弧开口包络
-examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影）
+    balance.py         # 静平衡配重：≤2 槽精确枚举、9^k 偏差情景穷举、四级并列择优
+examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影、静平衡配重）
 scripts/fuzz_check.py  # 与网格暴力 DP 的随机对拍
-tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、HTTP API 测试
+tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、静平衡配重（含独立暴力对拍）、HTTP API 测试
 Dockerfile
 docker-compose.yml
 ```

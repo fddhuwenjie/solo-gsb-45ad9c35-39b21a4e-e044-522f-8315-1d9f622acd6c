@@ -26,8 +26,13 @@ from .models import (
     InterlockStatusSegment,
     ProjectDomeApertureRequest,
     ProjectDomeApertureResponse,
+    PlanDomeBalanceRequest,
+    PlanDomeBalanceResponse,
+    BalanceWeightItem,
+    MomentVector2,
     TrackRequest,
     TrackResponse,
+    WorstDeviationItem,
 )
 from .planner.aperture import (
     ANGLE_EPS,
@@ -37,6 +42,7 @@ from .planner.aperture import (
     ensure_origin_inside,
     project_ray,
 )
+from .planner.balance import Slot, plan_balance, slot_levels
 from .planner.calibration import calibrate_sync, normalize_bias
 from .planner.interlock import Event, InterlockValidationError, audit_interlock
 from .planner.solver import Problem, solve
@@ -345,4 +351,81 @@ def project_dome_aperture(
         dome_radius=radius,
         origin=EnuPoint(east=origin.e, north=origin.n, up=origin.u),
         results=sample_results,
+    )
+
+
+@app.post(
+    "/api/v1/plan-dome-balance",
+    response_model=PlanDomeBalanceResponse,
+    tags=["balance"],
+)
+def plan_dome_balance(
+    req: PlanDomeBalanceRequest,
+) -> PlanDomeBalanceResponse:
+    # 规划器内部按槽位 ID 升序枚举，请求数组顺序不影响结果。
+    slots = [
+        Slot(
+            id=s.id,
+            radius=s.radius,
+            azimuth_deg=s.azimuth,
+            mass_limit=s.mass_limit,
+            levels=slot_levels(s.mass_limit, req.mass_step),
+        )
+        for s in sorted(req.slots, key=lambda s: s.id)
+    ]
+    plan = plan_balance(
+        parts=[(p.mass, p.radius, p.azimuth) for p in req.installed_parts],
+        slots=slots,
+        mass_step=req.mass_step,
+        mass_tolerance_ratio=req.mass_tolerance_ratio,
+        azimuth_tolerance_deg=req.azimuth_tolerance,
+        residual_moment_limit=req.residual_moment_limit,
+    )
+
+    return PlanDomeBalanceResponse(
+        original_moment=MomentVector2(
+            east=round(plan.original_x, 9),
+            north=round(plan.original_y, 9),
+        ),
+        original_magnitude=round(plan.original_magnitude, 9),
+        weights=[
+            BalanceWeightItem(
+                slot_id=w.slot_id,
+                radius=round(w.radius, 9),
+                nominal_mass=round(w.nominal_mass, 9),
+                nominal_azimuth=round(w.nominal_azimuth_deg, 9),
+                worst_mass=round(w.worst_mass, 9),
+                worst_azimuth=round(w.worst_azimuth_deg, 9),
+            )
+            for w in plan.weights
+        ],
+        total_balance_mass=round(plan.total_balance_mass, 9),
+        nominal_residual=MomentVector2(
+            east=round(plan.nominal_x, 9),
+            north=round(plan.nominal_y, 9),
+        ),
+        nominal_magnitude=round(plan.nominal_magnitude, 9),
+        worst_residual=MomentVector2(
+            east=round(plan.worst_x, 9),
+            north=round(plan.worst_y, 9),
+        ),
+        worst_magnitude=round(plan.worst_magnitude, 9),
+        worst_deviation_combo=[
+            WorstDeviationItem(
+                slot_id=c.slot_id,
+                mass=round(c.mass, 9),
+                azimuth=round(c.azimuth_deg, 9),
+                mass_sign=c.mass_sign,
+                azimuth_sign=c.azimuth_sign,
+            )
+            for c in plan.worst_combo
+        ],
+        residual_moment_limit=round(plan.residual_limit, 9),
+        compliant=plan.compliant,
+        details={
+            "evaluated_plans": plan.evaluated_plans,
+            "max_scenarios_per_plan": plan.max_scenarios_per_plan,
+            "slot_ids": list(plan.slot_ids),
+            "mass_vector": [round(m, 9) for m in plan.mass_vector],
+        },
     )
