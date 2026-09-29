@@ -467,6 +467,126 @@ curl -X POST http://localhost:8000/api/v1/project-dome-aperture \
 `B = o·d ≥ 0` 时正根取 `-c/(B+√(B²−c))`），在起点贴近球面的**近切线**
 情形下避免相消误差。
 
+### POST `/api/v1/plan-dome-balance`
+
+为圆顶**检修后静平衡**规划离散槽位配重：给定已装部件的质量、旋转轴半径
+与方位（质量矩 = 质量 × 半径，方位**北为 0°、向东递增**），在至多两个
+候选槽位上加装离散配重，使残余质量矩最小，并穷举每个配重的质量/方位
+偏差组合做验收。
+
+约定：
+
+- 残余质量矩 = 原始质量矩 + 各配重质量矩的**向量和**。配重装在槽位给定
+  方位处、质量矩方向与槽位半径向量同向，因此要抵消原始质量矩，槽位应
+  位于其**对侧**（方位相差约 180°）；
+- 每个槽位的配重质量取 `mass_step` 的非负整数倍，非零档位最多 **40** 个，
+  且最大非零档位质量 `40·mass_step` 不得超过该槽 `mass_limit`
+  （同时要求 `mass_step ≤ mass_limit`，即每槽至少 1 个非零档位）；
+- 候选槽位 1..8 个，每个方案**最多使用两个槽位**（每槽一个配重，允许
+  只用一个或一个都不加）；
+- 每个非零配重的质量独立取标称及 `± mass_tolerance_ratio · mass`
+  （三档），方位独立取标称及 `± azimuth_tolerance`（三档），构成 9 个
+  情景；两个配重再做笛卡尔积（最多 9×9=81 个情景），**全部穷举**，
+  取残余模长最大者为“最坏情景”。偏差为 0 时 9 个情景退化重合，仍逐一
+  计入穷举计数。
+
+**请求字段**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `installed_parts` | object[] | 已装部件（长度 1..5000） |
+| `installed_parts[].mass` | number | 部件质量（> 0） |
+| `installed_parts[].radius` | number | 部件相对旋转轴的半径（> 0） |
+| `installed_parts[].azimuth` | number | 质量矩方位角（度，北 0° 向东递增，可取任意实数） |
+| `slots` | object[] | 候选槽位（1..8 个，`id` 非空且唯一） |
+| `slots[].id` | string | 槽位 ID |
+| `slots[].radius` | number | 槽位相对旋转轴的半径（> 0） |
+| `slots[].azimuth` | number | 槽位半径向量方位角（度，北 0° 向东递增，可取任意实数） |
+| `slots[].mass_limit` | number | 该槽最大配重质量（> 0；要求 `mass_step ≤ mass_limit ≤ 40·mass_step`） |
+| `mass_step` | number | 统一质量档位步长（> 0） |
+| `mass_tolerance_ratio` | number | 质量对称相对偏差（[0, 1]）：质量取标称及 ±该比例 |
+| `azimuth_tolerance` | number | 方位对称偏差半宽（度，≥ 0） |
+| `residual_moment_limit` | number | 残余质量矩模长验收限值（≥ 0，质量 × 长度单位） |
+
+择优规则（依次比较；前三项标量差值不超过 `1e-9` 视为并列）：
+
+1. **最坏残余质量矩模长**（全部偏差情景最大值）最小；
+2. **标称残余质量矩模长**最小；
+3. **总配重质量**最小；
+4. 按槽位 ID 排序的**全槽位**质量向量（未使用槽位记 0）字典序最小。
+
+最坏偏差组合并列时，取按槽位 ID 顺序、先质量偏差 `(low, nominal, high)`
+后方位偏差 `(minus, nominal, plus)` 的首个组合。注意：**标称最优的方案
+不一定最坏最优**——大质量矩配重的偏差敏感度更高，接口按最坏残余择优。
+
+**示例请求**：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/plan-dome-balance \
+  -H 'Content-Type: application/json' \
+  -d @examples/plan_dome_balance_request.json
+```
+
+**响应**（HTTP 200；即使最坏残余超限也返回 200，以 `feasible` 标识是否
+达标，并照常返回全部枚举中的最优方案）：
+
+```json
+{
+  "feasible": true,
+  "residual_moment_limit": 1.2,
+  "original_moment": {
+    "north": 2.954423259,
+    "east": 17.479055467,
+    "magnitude": 17.726984989,
+    "azimuth": 80.406175127
+  },
+  "weights": [
+    {"slot_id": "A", "level": 29, "mass": 14.5, "radius": 1.2, "azimuth": 260.0},
+    {"slot_id": "C", "level": 1, "mass": 0.5, "radius": 1.0, "azimuth": 300.0}
+  ],
+  "total_counterweight_mass": 15.0,
+  "nominal_residual": {
+    "north": 0.182944968,
+    "east": -0.089612137,
+    "magnitude": 0.203713515,
+    "azimuth": 333.902949473
+  },
+  "worst_residual": {
+    "north": 0.733071365,
+    "east": -0.705273631,
+    "magnitude": 1.01725342,
+    "azimuth": 316.107171512
+  },
+  "worst_deviation": [
+    {"slot_id": "A", "mass_deviation": "high", "azimuth_deviation": "plus"},
+    {"slot_id": "C", "mass_deviation": "high", "azimuth_deviation": "plus"}
+  ],
+  "plans_evaluated": 4921,
+  "scenarios_evaluated": 389881
+}
+```
+
+字段说明：
+
+- `original_moment` / `nominal_residual` / `worst_residual` 均为
+  `{north, east, magnitude, azimuth}` 二维向量（方位角归一化到
+  `[0, 360)`，零向量方位记 0）；
+- `weights` 与 `worst_deviation` 都按槽位 ID 升序排列；零配重方案
+  （原始已平衡或任何配重都只会更差）时二者均为空列表、
+  `total_counterweight_mass = 0`；
+- `worst_deviation` 的 `mass_deviation` 取 `low`/`nominal`/`high`
+  （−比例 / 0 / +比例），`azimuth_deviation` 取
+  `minus`/`nominal`/`plus`（−容差 / 0 / +容差）；
+- `plans_evaluated` 为枚举方案总数（`1 + Σ档位数 + 跨槽档位对`），
+  `scenarios_evaluated` 为穷举的偏差情景总数（空方案 1、单槽 9/档、
+  双槽 81/对）。8 槽 ×40 档的最大规模约枚举 4.5 万个方案、360 万个情景。
+
+**HTTP 422**：槽位为空或超过 8 个、槽位 ID 为空或重复、`mass_step`
+非正、某槽非零档位数超过 40（`40·mass_step > mass_limit`）或不足 1
+（`mass_limit < mass_step`）、质量/半径非正、`mass_tolerance_ratio`
+不在 `[0, 1]`、`azimuth_tolerance` 或 `residual_moment_limit` 为负、
+NaN/无穷大等。
+
 ## 算法说明
 
 角度使用**未展开（unwrapped）**表示，因此跨 0°/360° 的跟踪不需要特判：每个
@@ -509,7 +629,7 @@ python3 scripts/fuzz_check.py
 
 ```
 app/
-  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture
+  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture、/api/v1/plan-dome-balance
   models.py            # Pydantic 请求/响应模型与参数校验
   planner/
     geometry.py        # 方位归一化、狭缝窗口（lift）、线缆裁剪、区间合并
@@ -518,9 +638,10 @@ app/
     calibration.py     # 最短弧展开 + 时延枚举/离群剔除/RMSE 同步标定
     interlock.py       # 安全联锁审计：分段常值重放、天气状态机、关闭义务
     aperture.py        # 视轴射线-偏心球面稳定求交、球面方位/高度、最短覆盖圆弧开口包络
-examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影）
+    balance.py         # 静平衡配重：槽位档位精确枚举 + 质量/方位偏差情景穷举、四级择优
+examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影、静平衡配重）
 scripts/fuzz_check.py  # 与网格暴力 DP 的随机对拍
-tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、HTTP API 测试
+tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、静平衡配重、HTTP API 测试
 Dockerfile
 docker-compose.yml
 ```

@@ -478,3 +478,141 @@ class ProjectDomeApertureResponse(BaseModel):
     dome_radius: float
     origin: EnuPoint
     results: list[ApertureSampleResult]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/plan-dome-balance
+# ---------------------------------------------------------------------------
+
+
+class InstalledPartModel(BaseModel):
+    mass: float = Field(
+        ..., gt=0, allow_inf_nan=False, description="已装部件质量（> 0）"
+    )
+    radius: float = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="部件相对旋转轴的半径（> 0，长度单位）",
+    )
+    azimuth: float = Field(
+        ..., allow_inf_nan=False,
+        description="部件质量矩方位角（度，北为 0°、向东递增，可取任意实数）",
+    )
+
+
+class BalanceSlotModel(BaseModel):
+    id: str = Field(
+        ..., min_length=1, description="槽位 ID（非空字符串，请求内唯一）"
+    )
+    radius: float = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="槽位相对旋转轴的半径（> 0，长度单位）",
+    )
+    azimuth: float = Field(
+        ..., allow_inf_nan=False,
+        description="槽位半径向量方位角（度，北为 0°、向东递增，可取任意实数）",
+    )
+    mass_limit: float = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="该槽允许的最大配重质量（> 0）；要求 40*mass_step 不超过它",
+    )
+
+
+class PlanDomeBalanceRequest(BaseModel):
+    installed_parts: list[InstalledPartModel] = Field(
+        ..., min_length=1, max_length=5000,
+        description="已装部件清单（长度 1..5000）",
+    )
+    slots: list[BalanceSlotModel] = Field(
+        ..., min_length=1, max_length=8, description="候选槽位（1..8 个）"
+    )
+    mass_step: float = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="统一质量档位步长（> 0）；每槽配重质量取其非负整数倍",
+    )
+    mass_tolerance_ratio: float = Field(
+        ..., ge=0, le=1, allow_inf_nan=False,
+        description="配重质量对称相对偏差（[0, 1]）：质量取标称及 ±该比例",
+    )
+    azimuth_tolerance: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="配重方位对称偏差半宽（度，>= 0）：方位取标称及 ±该值",
+    )
+    residual_moment_limit: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="残余质量矩模长验收限值（>= 0，质量 × 长度单位）",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "PlanDomeBalanceRequest":
+        ids = [s.id for s in self.slots]
+        if len(set(ids)) != len(ids):
+            raise ValueError("slots 的 id 必须唯一")
+        # 每槽非零档位 = floor(mass_limit / mass_step)，要求 1..40
+        bad = []
+        for s in self.slots:
+            n_levels = math.floor(s.mass_limit / self.mass_step + 1e-9)
+            if n_levels < 1 or n_levels > 40:
+                bad.append(s.id)
+        if bad:
+            raise ValueError(
+                "以下槽位的非零质量档位数不在 1..40 之间（要求 mass_step <= "
+                "mass_limit <= 40*mass_step）：" + ", ".join(bad)
+            )
+        return self
+
+
+class BalanceVector(BaseModel):
+    north: float = Field(..., description="质量矩北向分量")
+    east: float = Field(..., description="质量矩东向分量")
+    magnitude: float = Field(..., description="质量矩模长（>= 0）")
+    azimuth: float = Field(
+        ..., description="质量矩方位角（度，[0, 360)，北为 0°）；零向量记 0"
+    )
+
+
+class BalanceWeightItem(BaseModel):
+    slot_id: str
+    level: int = Field(..., description="质量档位（质量 = level * mass_step，>= 1）")
+    mass: float
+    radius: float
+    azimuth: float = Field(..., description="槽位标称方位角（度，回显输入）")
+
+
+class WorstDeviationItem(BaseModel):
+    slot_id: str
+    mass_deviation: Literal["low", "nominal", "high"] = Field(
+        ..., description="该配重的质量偏差档：low=-比例 / nominal=0 / high=+比例"
+    )
+    azimuth_deviation: Literal["minus", "nominal", "plus"] = Field(
+        ..., description="该配重的方位偏差档：minus=-容差 / nominal=0 / plus=+容差"
+    )
+
+
+class PlanDomeBalanceResponse(BaseModel):
+    feasible: bool = Field(
+        ..., description="择优方案的最坏残余质量矩是否不超过 residual_moment_limit"
+    )
+    residual_moment_limit: float
+    original_moment: BalanceVector = Field(..., description="未补偿的原始质量矩")
+    weights: list[BalanceWeightItem] = Field(
+        ...,
+        description="入选配重清单（至多两个，按槽位 ID 排序）；零配重方案为空列表",
+    )
+    total_counterweight_mass: float = Field(
+        ..., description="入选方案总配重质量（零配重方案为 0）"
+    )
+    nominal_residual: BalanceVector = Field(
+        ..., description="标称参数下的残余质量矩"
+    )
+    worst_residual: BalanceVector = Field(
+        ...,
+        description="全部偏差验收情景中残余模长最大的情景（并列取偏差组合字典序首个）",
+    )
+    worst_deviation: list[WorstDeviationItem] = Field(
+        ...,
+        description="最坏情景下各配重（按槽位 ID 顺序）的偏差档；零配重方案为空",
+    )
+    plans_evaluated: int = Field(..., description="枚举的配重方案总数")
+    scenarios_evaluated: int = Field(
+        ..., description="穷举的偏差验收情景总数（含偏差为 0 时的退化重合）"
+    )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .models import (
@@ -15,19 +16,26 @@ from .models import (
     ApertureSampleResult,
     AuditSafetyInterlockRequest,
     AuditSafetyInterlockResponse,
+    BalanceSlotModel,
+    BalanceVector,
+    BalanceWeightItem,
     CalibrateSyncRequest,
     CalibrateSyncResponse,
     EnuPoint,
     FailureDetail,
     HealthResponse,
+    InstalledPartModel,
     InterlockCommandRecord,
     InterlockRiskInterval,
     InterlockShutterSegment,
     InterlockStatusSegment,
+    PlanDomeBalanceRequest,
+    PlanDomeBalanceResponse,
     ProjectDomeApertureRequest,
     ProjectDomeApertureResponse,
     TrackRequest,
     TrackResponse,
+    WorstDeviationItem,
 )
 from .planner.aperture import (
     ANGLE_EPS,
@@ -37,6 +45,7 @@ from .planner.aperture import (
     ensure_origin_inside,
     project_ray,
 )
+from .planner.balance import BalanceSlot, InstalledPart, plan_dome_balance
 from .planner.calibration import calibrate_sync, normalize_bias
 from .planner.interlock import Event, InterlockValidationError, audit_interlock
 from .planner.solver import Problem, solve
@@ -73,6 +82,23 @@ async def aperture_validation_error_handler(
 ) -> JSONResponse:
     # 视轴起点不在球内 / 误差越出高度角范围 / 交点低于地平面 → HTTP 422
     return JSONResponse(status_code=422, content=exc.payload)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # 默认处理器会把输入中的 NaN/Infinity 原样回显，导致 JSON 序列化崩溃；
+    # 这里仅回显字段定位与错误类型，统一返回 HTTP 422。
+    detail = [
+        {
+            "type": err.get("type"),
+            "loc": list(err.get("loc", [])),
+            "msg": err.get("msg"),
+        }
+        for err in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": detail})
 
 
 @app.post("/api/v1/track", response_model=TrackResponse, tags=["tracking"])
@@ -345,4 +371,95 @@ def project_dome_aperture(
         dome_radius=radius,
         origin=EnuPoint(east=origin.e, north=origin.n, up=origin.u),
         results=sample_results,
+    )
+
+
+def _r9(value: float | None) -> float | None:
+    """四舍五入到 9 位小数并消除负零（-0.0 → 0.0），便于 JSON 展示稳定。
+
+    ``None`` 原样返回（联锁接口用 None 表示开口段终点等缺失值）。
+    """
+    if value is None:
+        return None
+    out = round(value, 9)
+    return 0.0 if out == 0 else out
+
+
+def _balance_vector_model(rx: float, ry: float, mag: float, az: float) -> BalanceVector:
+    return BalanceVector(
+        north=_r9(rx),
+        east=_r9(ry),
+        magnitude=_r9(mag),
+        azimuth=_r9(az),
+    )
+
+
+@app.post(
+    "/api/v1/plan-dome-balance",
+    response_model=PlanDomeBalanceResponse,
+    tags=["balance"],
+)
+def plan_dome_balance_endpoint(
+    req: PlanDomeBalanceRequest,
+) -> PlanDomeBalanceResponse:
+    parts = [
+        InstalledPart(mass=p.mass, radius=p.radius, azimuth=p.azimuth)
+        for p in req.installed_parts
+    ]
+    # 槽位顺序无关：planner 内部按槽位 ID 排序（决定质量向量字典序等）
+    slots = [
+        BalanceSlot(
+            slot_id=s.id,
+            radius=s.radius,
+            azimuth=s.azimuth,
+            mass_limit=s.mass_limit,
+        )
+        for s in req.slots
+    ]
+
+    result = plan_dome_balance(
+        parts=parts,
+        slots=slots,
+        mass_step=req.mass_step,
+        mass_tolerance_ratio=req.mass_tolerance_ratio,
+        azimuth_tolerance=req.azimuth_tolerance,
+        residual_moment_limit=req.residual_moment_limit,
+    )
+
+    return PlanDomeBalanceResponse(
+        feasible=result.feasible,
+        residual_moment_limit=_r9(result.residual_moment_limit),
+        original_moment=_balance_vector_model(
+            result.original_rx, result.original_ry,
+            result.original_magnitude, result.original_azimuth,
+        ),
+        weights=[
+            BalanceWeightItem(
+                slot_id=w.slot_id,
+                level=w.level,
+                mass=_r9(w.mass),
+                radius=_r9(w.radius),
+                azimuth=_r9(w.azimuth),
+            )
+            for w in result.weights
+        ],
+        total_counterweight_mass=_r9(result.total_mass),
+        nominal_residual=_balance_vector_model(
+            result.nominal_rx, result.nominal_ry,
+            result.nominal_magnitude, result.nominal_azimuth,
+        ),
+        worst_residual=_balance_vector_model(
+            result.worst_rx, result.worst_ry,
+            result.worst_magnitude, result.worst_azimuth,
+        ),
+        worst_deviation=[
+            WorstDeviationItem(
+                slot_id=d["slot_id"],
+                mass_deviation=d["mass_deviation"],
+                azimuth_deviation=d["azimuth_deviation"],
+            )
+            for d in result.worst_deviation
+        ],
+        plans_evaluated=result.plans_evaluated,
+        scenarios_evaluated=result.scenarios_evaluated,
     )
